@@ -1,101 +1,75 @@
-"""
-TCP chat client for the final SEP300 assignment.
+"""Command-line client for the TCP chat server."""
 
-This program connects to the chat server, sends user input to the server,
-and prints all messages received from the server.
-"""
+import os
+import socket
+import threading
 
-import socket # To connect to the server
-import threading # to listen to server messages in the background
-import sys # to call sys.exit if the server disconnects
+SERVER_HOST = os.environ.get("CHAT_HOST", "127.0.0.1")
+SERVER_PORT = int(os.environ.get("CHAT_PORT", "5000"))
 
-# The server must use the same HOST and PORT as in server.py.
-SERVER_HOST = "127.0.0.1"  # localhost
-SERVER_PORT = 5000        # must match PORT in server.py
 
-def send_line(sock: socket.socket, text: str) -> None:
-    """
-    Send a line of text to the server, adding a newline at the end.
-    """
-    data = (text + "\n").encode("utf-8")
-    sock.sendall(data)
+def send_line(connection: socket.socket, message: str) -> None:
+    """Send one UTF-8 line to the server."""
+    connection.sendall((message + "\n").encode("utf-8"))
 
-def listen_to_server(sock: socket.socket) -> None:
-    """
-    Continuously read lines from the server and print them.
 
-    Runs in a separate thread so that the main thread can handle user input.
-    """
-    # Wrap the socket as a file-like object so we can use .readline().
-    file_obj = sock.makefile("r", encoding="utf-8")
-
+def listen_to_server(
+    connection: socket.socket,
+    disconnected: threading.Event,
+) -> None:
+    """Print messages received from the server until it closes the connection."""
     try:
-        while True:
-            line = file_obj.readline()
-            if not line:
-                # Server closed the connection.
-                print("\n[INFO] Server closed the connection.")
-                # Exit the whole program.
-                sys.exit(0)
+        with connection.makefile("r", encoding="utf-8") as reader:
+            for line in reader:
+                print(f"\n{line.rstrip()}")
+                print("> ", end="", flush=True)
+    except OSError as error:
+        print(f"\nConnection error: {error}")
+    finally:
+        disconnected.set()
+        print("\n[INFO] Server connection closed.")
 
-            # Strip the newline and print the message.
-            line = line.rstrip("\n")
-            print(f"\n{line}")
-            print("> ", end="", flush=True)  # re-show prompt
-    except Exception as exc:
-        print(f"\n[ERROR] Connection error: {exc}")
-        sys.exit(1)
 
 def main() -> None:
-    """
-    Connect to the chat server and start the send/receive loops.
-    """
-    # 1. Create a TCP socket.
-    #Same idea as in server.py , but now connnecting to server instead of listening for clients.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
+    """Connect to the server and send user-entered lines."""
     try:
-        # 2. Connect to the server.
-        sock.connect((SERVER_HOST, SERVER_PORT))
-    except OSError as exc:
-        print(f"Could not connect to server at {SERVER_HOST}:{SERVER_PORT}: {exc}")
+        connection = socket.create_connection((SERVER_HOST, SERVER_PORT))
+    except OSError as error:
+        print(f"Could not connect to {SERVER_HOST}:{SERVER_PORT}: {error}")
         return
 
-    print(f"Connected to chat server at {SERVER_HOST}:{SERVER_PORT}")
-    print("Follow the instructions from the server to register or log in.")
-    print("Type '/quit' to exit.\n")
+    print(f"Connected to {SERVER_HOST}:{SERVER_PORT}. Type '/quit' to leave.")
 
-    # 3. Start the background listener thread.
-    listener_thread = threading.Thread(
+    disconnected = threading.Event()
+    listener = threading.Thread(
         target=listen_to_server,
-        args=(sock,),
-        daemon=True,  # exits automatically when main thread exits
+        args=(connection, disconnected),
+        daemon=True,
     )
-    listener_thread.start()
+    listener.start()
 
-    # 4. Main loop: read user input and send it to the server.
     try:
-        while True:
-            # Show a prompt and read a line from the user.
-            user_input = input("> ").strip()
-            if not user_input:
-                continue
-
-            # If the user types /quit, send it and break.
-            if user_input == "/quit":
-                send_line(sock, user_input)
+        while not disconnected.is_set():
+            try:
+                message = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[INFO] Leaving chat.")
                 break
 
-            # Otherwise, send the line to the server.
-            send_line(sock, user_input)
-    except KeyboardInterrupt:
-        print("\n[INFO] KeyboardInterrupt: exiting.") # IF we want to exit by Ctrl+C
+            if not message:
+                continue
+
+            try:
+                send_line(connection, message)
+            except OSError:
+                print("[INFO] Could not send message; the server may have closed.")
+                break
+
+            if message == "/quit":
+                break
     finally:
-        # Close the socket when done.
-        try:
-            sock.close() # ask the OS to close the socket
-        except OSError:
-            pass
+        connection.close()
+        listener.join(timeout=1)
 
 
 if __name__ == "__main__":

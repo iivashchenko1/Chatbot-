@@ -1,75 +1,37 @@
-"""
-Authentication helpers for the chat application.
+"""Password hashing and verification helpers for the chat application."""
 
-This module is responsible for hashing passwords when users
-create accounts and for verifying passwords during login.
-"""
+import hashlib
+import hmac
+import os
 
-import os 
-import hashlib #Gives an access to a Hash functions 
-from typing import Tuple
+PBKDF2_ITERATIONS = 100_000
+SALT_BYTES = 16
 
 
-def hash_password(password: str) -> Tuple[str, str]: #return a tuple of salt_hex and hash_hex
-    """
-    Convert a plain-text password into a (salt, hash) pair.
-
-    The salt and hash are returned as hexadecimal strings so that
-    they can be stored easily in a TEXT column in the database.
-    """
-    # 1. Generate a random 16-byte salt using a cryptographically
-    #    secure random number generator.
-    salt = os.urandom(16)
-
-    # 2. Derive a secure hash from the password and salt using
-    #    PBKDF2-HMAC with SHA-256.
-    hash_bytes = hashlib.pbkdf2_hmac(
-        "sha256",              # Name of the hash function.
-        password.encode("utf-8"),  # Password converted to bytes.
-        salt,                  # The random salt.
-        100_000,               # Number of iterations (100k), if number is larger it works slower.
-    )
-
-    # 3. Convert salt and hash to hex strings for storage.
-    salt_hex = salt.hex()
-    hash_hex = hash_bytes.hex()
-
-    return salt_hex, hash_hex
-
-
-def verify_password(password: str, salt_hex: str, stored_hash_hex: str) -> bool: # return True or False
-    """
-    Verify that a plain-text password matches the stored hash.
-
-    Args:
-        password: The password provided by the user during login.
-        salt_hex: The salt stored in the database (hex string).
-        stored_hash_hex: The password hash stored in the database (hex string).
-
-    Returns:
-        True if the password is correct, False otherwise.
-    """
-    # 1. Convert the hex-encoded salt back into bytes.
-    salt = bytes.fromhex(salt_hex)
-
-    # 2. Recompute the hash using the same parameters as in hash_password.
-    new_hash_bytes = hashlib.pbkdf2_hmac(
+def hash_password(password: str) -> tuple[str, str]:
+    """Return a random salt and a PBKDF2-HMAC-SHA256 password hash as hex."""
+    salt = os.urandom(SALT_BYTES)
+    password_hash = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
         salt,
-        100_000,
+        PBKDF2_ITERATIONS,
     )
-    #We used exact the same parameters as for hash_pasword . The only difference is : the password is whatever user types during login.
-
-    # 3. Convert the new hash to hex and compare with the stored hash.
-    new_hash_hex = new_hash_bytes.hex()
-
-    return new_hash_hex == stored_hash_hex
-"""
-If they are equal = login success
-if they are different = wrong password
-"""
+    return salt.hex(), password_hash.hex()
 
 
+def verify_password(password: str, salt_hex: str, stored_hash_hex: str) -> bool:
+    """Check a password against its stored salt and hash."""
+    try:
+        salt = bytes.fromhex(salt_hex)
+        stored_hash = bytes.fromhex(stored_hash_hex)
+    except ValueError:
+        return False
 
-
+    candidate_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ITERATIONS,
+    )
+    return hmac.compare_digest(candidate_hash, stored_hash)

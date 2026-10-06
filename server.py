@@ -1,161 +1,128 @@
-"""
-TCP chat server for the final SEP300 assignment.
+"""Threaded TCP chat server with SQLite-backed accounts and message history."""
 
-Responsibilities:
-- listen for incoming TCP connections on a fixed PORT,
-- handle registration and login using the database module,
-- broadcast chat messages to all connected clients,
-- store chat messages in the SQLite database.
-"""
+import logging
+import os
+import socket
+import threading
 
-import socket 
-import threading # Run each client connection in its own thread
-
-from database import ( # We reuse all the database that we created before
-    init_db,
-    create_user,
+from database import (
     authenticate_user,
-    save_message,
+    create_user,
     get_recent_messages,
+    init_db,
+    save_message,
 )
 
-# Server configuration: one host, one port.
-HOST = "0.0.0.0"   # Listen on all network interfaces and accept connection only on IP. 
-PORT = 5000       # You can change this if you want to one port for all clients.
+HOST = os.environ.get("CHAT_HOST", "0.0.0.0")
+PORT = int(os.environ.get("CHAT_PORT", "5000"))
 
-# Global list of connected clients.
-# Each item is a dictionary: {"conn": socket_object, "username": str}
-clients: list[dict] = []  
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-# A lock so that multiple threads can modify 'clients' safely.
-clients_lock = threading.Lock() # perevents race conditoins when several threads try to modify the clients list at the same time,
-                                #Makes sure only one thread touches the list at once.
+clients: list[dict[str, object]] = []
+clients_lock = threading.Lock()
 
 
-def send_line(conn: socket.socket, text: str) -> None:
-    """
-    Send a single line of text to the client, adding a newline at the end.
-    """
-    data = (text + "\n").encode("utf-8") #Ensure that client sees full message by encoding it to bytes
-    conn.sendall(data) # sends all bytes
+def send_line(connection: socket.socket, message: str) -> None:
+    """Send one UTF-8 line to a client."""
+    connection.sendall((message + "\n").encode("utf-8"))
 
-def broadcast_message(sender_username: str, content: str) -> None:
-    """
-    Save a chat message to the database and send it to all connected clients.
-    """
-    # 1) Save in the database.
-    save_message(sender_username, content) # Use our database module 
 
-    # 2) Prepare the line to send to clients.
-    line = f"[{sender_username}] {content}" # simple format for chat message
+def broadcast_message(username: str, content: str) -> None:
+    """Save a message, then send it to each connected client."""
+    save_message(username, content)
+    message = f"[{username}] {content}"
 
-    # 3) Send to every connected client.
     with clients_lock:
-        # Make a copy so we don't get issues if the list changes while iterating.
         current_clients = list(clients)
 
     for client in current_clients:
-        conn = client["conn"]
+        connection = client["conn"]
         try:
-            send_line(conn, line)
+            send_line(connection, message)  # type: ignore[arg-type]
         except OSError:
-            # If sending fails (client closed connection), ignore here.
-            # The client thread will clean up.
-            continue
+            logger.info("Could not send to a disconnected client.")
 
-def handle_client(conn: socket.socket, addr) -> None:
-    """
-    Handle a single client connection in its own thread.
-    """
-    print(f"[INFO] New connection from {addr}")
+
+def handle_client(connection: socket.socket, address: tuple[str, int]) -> None:
+    """Handle registration/login and chat messages for one client."""
     username: str | None = None
+    reader = connection.makefile("r", encoding="utf-8")
 
-    # Wrap the raw socket in a file-like object so we can use .readline().
-    file_obj = conn.makefile("r", encoding="utf-8")
+    logger.info("Connection opened from %s", address)
 
     try:
-        # --- Step 1: Welcome and authentication ---
-        send_line(conn, "Welcome to the chat server!")
-        send_line(conn, "Type 'register' to create an account or 'login' to sign in:")
+        send_line(connection, "Welcome to the chat server!")
+        send_line(connection, "Type 'register' to create an account or 'login' to sign in:")
 
         while username is None:
-            command = file_obj.readline() # Turns the socket into a file-like object so we call readline
+            command = reader.readline()
             if not command:
-                # Client disconnected before doing anything.
-                print(f"[INFO] {addr} disconnected during auth.")
                 return
 
             command = command.strip().lower()
 
             if command == "register":
-                # Ask for username and password and call create_user.
-                send_line(conn, "Choose a username:")
-                uname = file_obj.readline()
-                if not uname:
+                send_line(connection, "Choose a username:")
+                requested_username = reader.readline()
+                if not requested_username:
                     return
-                uname = uname.strip()
 
-                send_line(conn, "Choose a password:")
-                pw = file_obj.readline()
-                if not pw:
+                send_line(connection, "Choose a password:")
+                password = reader.readline()
+                if not password:
                     return
-                pw = pw.strip()
 
-                if not uname or not pw:
-                    send_line(conn, "Username and password cannot be empty. Try again.")
-                    continue
+                requested_username = requested_username.strip()
+                password = password.rstrip("\r\n")
 
-                if create_user(uname, pw):
-                    send_line(conn, "Account created successfully! Type 'login' to sign in.") #Infrom if it is successful
+                if not requested_username or not password:
+                    send_line(connection, "Username and password cannot be empty.")
+                elif create_user(requested_username, password):
+                    send_line(connection, "Account created. Type 'login' to sign in.")
                 else:
-                    send_line(conn, "Username already exists. Try another username.")#Inform if username is already taken
+                    send_line(connection, "That username is already taken.")
 
             elif command == "login":
-                # Ask for username and password and call authenticate_user.
-                send_line(conn, "Username:")
-                uname = file_obj.readline()
-                if not uname:
+                send_line(connection, "Username:")
+                requested_username = reader.readline()
+                if not requested_username:
                     return
-                uname = uname.strip()
 
-                send_line(conn, "Password:")
-                pw = file_obj.readline()
-                if not pw:
+                send_line(connection, "Password:")
+                password = reader.readline()
+                if not password:
                     return
-                pw = pw.strip()
 
-                if authenticate_user(uname, pw):
-                    username = uname
-                    send_line(conn, f"Login successful. Welcome, {username}!") # If returs True, login is successful. We set username to exit the loop
+                requested_username = requested_username.strip()
+                password = password.rstrip("\r\n")
+
+                if authenticate_user(requested_username, password):
+                    username = requested_username
+                    send_line(connection, f"Login successful. Welcome, {username}!")
                 else:
-                    send_line(conn, "Invalid username or password. Try again.") # Failed with username or password
+                    send_line(connection, "Invalid username or password. Try again.")
+
             else:
-                send_line(conn, "Please type either 'register' or 'login'.") # Asking to choose an action .
+                send_line(connection, "Please type 'register' or 'login'.")
 
-        # At this point, username is set → user is authenticated.
-
-        # Add this client to the global clients list.
         with clients_lock:
-            clients.append({"conn": conn, "username": username})
+            clients.append({"conn": connection, "username": username})
 
-        # Optionally send recent history.
-        send_line(conn, "--- Recent messages ---")
-        for u, content, created_at in get_recent_messages():
-            send_line(conn, f"[{created_at}] {u}: {content}")
-        send_line(conn, "--- End of history ---")
+        send_line(connection, "--- Recent messages ---")
+        for old_username, content, created_at in get_recent_messages():
+            send_line(connection, f"[{created_at}] {old_username}: {content}")
+        send_line(connection, "--- End of history ---")
 
-        # Inform others.
-        broadcast_message("SYSTEM", f"{username} has joined the chat.")
-
-        # --- Step 2: Main chat loop ---
-        send_line(conn, "You are now in the chatroom. Type messages and press Enter.")
-        send_line(conn, "Type '/quit' to exit.")
+        broadcast_message("SYSTEM", f"{username} joined the chat.")
+        send_line(connection, "You are now in the chat. Type '/quit' to leave.")
 
         while True:
-            line = file_obj.readline()
+            line = reader.readline()
             if not line:
-                # Client closed the connection.
-                print(f"[INFO] {username} at {addr} disconnected.")
                 break
 
             message = line.strip()
@@ -163,76 +130,55 @@ def handle_client(conn: socket.socket, addr) -> None:
                 continue
 
             if message == "/quit":
-                send_line(conn, "Goodbye!")
+                send_line(connection, "Goodbye!")
                 break
 
-            # Broadcast this message to everyone.
             broadcast_message(username, message)
 
-    except Exception as exc:
-        
-        # Any unexpected error: log it server-side.    
-        print(f"[ERROR] Exception in client handler for {addr}: {exc}")
-    
+    except (OSError, UnicodeError):
+        logger.info("Client %s disconnected.", address)
+    except Exception:
+        logger.exception("Unexpected error while handling client %s", address)
     finally:
-        
-        # Remove client from global list if logged in.
+        reader.close()
+
         if username is not None:
             with clients_lock:
                 clients[:] = [
-                    c for c in clients if c["conn"] is not conn
+                    client for client in clients
+                    if client["conn"] is not connection
                 ]
-            broadcast_message("SYSTEM", f"{username} has left the chat.")
+            try:
+                broadcast_message("SYSTEM", f"{username} left the chat.")
+            except Exception:
+                logger.exception("Could not save the departure message.")
 
-        conn.close()
-        print(f"[INFO] Connection with {addr} closed.")
+        connection.close()
+        logger.info("Connection closed for %s", address)
 
-    
+
 def main() -> None:
-    """
-    Entry point for the chat server: initialize the database,
-    create a listening socket, and handle incoming connections.
-    """
-    # Make sure the database and tables exist before any clients connects.
+    """Initialize storage and accept incoming TCP connections."""
     init_db()
 
-    # Create a TCP socket.
-    #We used TCP instead of UDP because TCP cares about correctness and guaranties that all data arrives in order.
-    #At the same time UDP is faster but it cxan lose some packets and the order of packets is not guaranteed.
-    
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) #SOCK_STREAM proof of TCP and AF_INET is for IPv4 addresses.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((HOST, PORT))
+        server_socket.listen()
+        logger.info("Chat server listening on %s:%s", HOST, PORT)
 
-    # Allow quick reuse of the same port after restarting the server.
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # Bind the socket to the chosen HOST and PORT.
-    server_sock.bind((HOST, PORT))
-
-    # Start listening and accepting for incoming connections.
-    server_sock.listen()
-    print(f"[INFO] Chat server listening on {HOST}:{PORT}")
-
-    try:
-        while True:
-            # Accept a new client connection.
-            conn, addr = server_sock.accept()
-
-            # Start a new thread for each client.
-            #hat way, if one client is slow or waiting for input, others still work
-            thread = threading.Thread(
-                target=handle_client,
-                args=(conn, addr),
-                daemon=True,  # Daemon thread will exit when main program exits.
-            )
-            thread.start()
-    except KeyboardInterrupt:
-        print("\n[INFO] Server shutting down...")
-    finally:
-        server_sock.close()
+        try:
+            while True:
+                connection, address = server_socket.accept()
+                thread = threading.Thread(
+                    target=handle_client,
+                    args=(connection, address),
+                    daemon=True,
+                )
+                thread.start()
+        except KeyboardInterrupt:
+            logger.info("Server shutting down.")
 
 
 if __name__ == "__main__":
     main()
-
-
-
